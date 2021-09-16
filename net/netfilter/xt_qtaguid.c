@@ -25,6 +25,9 @@
 #include <linux/skbuff.h>
 #include <linux/workqueue.h>
 #include <net/addrconf.h>
+#ifdef CONFIG_MPTCP
+#include <net/mptcp.h>
+#endif
 #include <net/sock.h>
 #include <net/tcp.h>
 #include <net/udp.h>
@@ -1191,6 +1194,11 @@ static void get_dev_and_dir(const struct sk_buff *skb,
 		       par->hooknum, __func__);
 		BUG();
 	}
+	if (unlikely(!(*el_dev)->name)) {
+		pr_err("qtaguid[%d]: %s(): no dev->name?!!\n",
+		       par->hooknum, __func__);
+		BUG();
+	}
 	if (skb->dev && *el_dev != skb->dev) {
 		MT_DEBUG("qtaguid[%d]: skb->dev=%p %s vs par->%s=%p %s\n",
 			 par->hooknum, skb->dev, skb->dev->name,
@@ -1309,6 +1317,11 @@ static void if_tag_stat_update(const char *ifname, uid_t uid,
 	 * Look for a tagged sock.
 	 * It will have an acct_uid.
 	 */
+#ifdef CONFIG_MPTCP
+	if (sysctl_mptcp_enabled != 0 && sk && mptcp(tcp_sk(sk))) {
+		sk = mptcp_meta_sk(sk);
+	}
+#endif
 	sock_tag_entry = get_sock_stat(sk);
 	if (sock_tag_entry) {
 		tag = sock_tag_entry->tag;
@@ -1925,11 +1938,24 @@ static int qtaguid_ctrl_proc_show(struct seq_file *m, void *v)
 			);
 		sk_ref_count = atomic_read(
 			&sock_tag_entry->sk->sk_refcnt);
-		seq_printf(m, "sock=%pK tag=0x%llx (uid=%u) pid=%u "
-			   "f_count=%d\n",
+#ifdef CONFIG_MPTCP
+		if (sysctl_mptcp_enabled != 0) {
+			seq_printf(m, "sock=%pK tag=0x%llx (uid=%u) pid=%u " "f_count=%d " "(fuid=%u)\n",
 			   sock_tag_entry->sk,
 			   sock_tag_entry->tag, uid,
-			   sock_tag_entry->pid, sk_ref_count);
+			   sock_tag_entry->pid,
+			   sk_ref_count,
+			   sock_tag_entry->fuid);
+		} else {
+#endif
+			seq_printf(m, "sock=%pK tag=0x%llx (uid=%u) pid=%u " "f_count=%d\n",
+			   sock_tag_entry->sk,
+			   sock_tag_entry->tag, uid,
+			   sock_tag_entry->pid,
+			   sk_ref_count);
+#ifdef CONFIG_MPTCP
+		}
+#endif
 	} else {
 		seq_printf(m, "events: sockets_tagged=%llu "
 			   "sockets_untagged=%llu "
@@ -2308,6 +2334,11 @@ static int ctrl_cmd_tag(const char *input)
 		sock_hold(el_socket->sk);
 		sock_tag_entry->sk = el_socket->sk;
 		sock_tag_entry->pid = current->tgid;
+#ifdef CONFIG_MPTCP
+		if (sysctl_mptcp_enabled != 0) {
+			sock_tag_entry->fuid = from_kuid(&init_user_ns, el_socket->sk->sk_uid);
+		}
+#endif
 		sock_tag_entry->tag = combine_atag_with_uid(acct_tag, uid_int);
 		pqd_entry = proc_qtu_data_tree_search(
 			&proc_qtu_data_tree, current->tgid);
@@ -2418,15 +2449,20 @@ int qtaguid_untag(struct socket *el_socket, bool kernel)
 	 * At first, we want to catch user-space code that is not
 	 * opening the /dev/xt_qtaguid.
 	 */
-	if (IS_ERR_OR_NULL(pqd_entry) || !sock_tag_entry->list.next) {
+	if (IS_ERR_OR_NULL(pqd_entry))
 		pr_warn_once("qtaguid: %s(): "
 			     "User space forgot to open /dev/xt_qtaguid? "
 			     "pid=%u tgid=%u sk_pid=%u, uid=%u\n", __func__,
 			     current->pid, current->tgid, sock_tag_entry->pid,
 			     from_kuid(&init_user_ns, current_fsuid()));
-	} else {
+/*
+ * This check is needed because tagging from a process that
+ * didn't open /dev/xt_qtaguid still adds the sock_tag_entry
+ * to sock_tag_tree.
+*/
+	if (sock_tag_entry->list.next)
 		list_del(&sock_tag_entry->list);
-	}
+
 	spin_unlock_bh(&uid_tag_data_tree_lock);
 	/*
 	 * We don't free tag_ref from the utd_entry here,
